@@ -14,6 +14,49 @@
 import Foundation
 import Kit
 
+// MARK: - CSV telemetry logger
+
+private final class TelemetryLogger {
+    static let shared = TelemetryLogger()
+
+    private let url: URL
+    private let queue = DispatchQueue(label: "eu.exelban.Stats.FanTelemetry")
+    private var handle: FileHandle?
+    private let isoFormatter: ISO8601DateFormatter = {
+        let f = ISO8601DateFormatter()
+        f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return f
+    }()
+
+    private init() {
+        let dir = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Stats")
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        self.url = dir.appendingPathComponent("fan-telemetry.csv")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            let header = "timestamp,cpu_max_temp,fan_id,actual_rpm,profile,engaged,target_fraction,target_rpm,sustained_s\n"
+            try? header.write(to: url, atomically: false, encoding: .utf8)
+        }
+    }
+
+    func log(timestamp: Date, temp: Double, fanID: Int, actualRPM: Double,
+             profile: String?, engaged: Bool, fraction: Double, targetRPM: Int,
+             sustained: TimeInterval?) {
+        let ts = isoFormatter.string(from: timestamp)
+        let prof = profile ?? ""
+        let sus = sustained.map { String(format: "%.1f", $0) } ?? ""
+        let line = "\(ts),\(String(format: "%.1f", temp)),\(fanID),\(String(format: "%.0f", actualRPM)),\(prof),\(engaged),\(String(format: "%.4f", fraction)),\(targetRPM),\(sus)\n"
+        queue.async { [weak self] in
+            guard let self, let data = line.data(using: .utf8) else { return }
+            if self.handle == nil {
+                self.handle = try? FileHandle(forWritingTo: self.url)
+                _ = try? self.handle?.seekToEnd()
+            }
+            try? self.handle?.write(contentsOf: data)
+        }
+    }
+}
+
 // Minimum RPM delta before issuing a new setFanSpeed SMC call.
 // Prevents constant SMC churn when temperature hovers around a curve knee.
 private let hysteresisRPMThreshold: Int = 100
@@ -128,16 +171,29 @@ public class FanProfileEngine {
             let fans = sensors.compactMap { $0 as? Fan }.filter { $0.id >= 0 }
 
             for fan in fans {
-                guard let profile = self.profileForFan(fan.id) else {
-                    // No enabled profile for this fan — release it if we owned it.
+                let profile = self.profileForFan(fan.id)
+                if profile == nil {
                     if self.fanStates[fan.id]?.engaged == true {
                         SMCHelper.shared.setFanMode(fan.id, mode: FanMode.automatic.rawValue)
                         self.fanStates[fan.id] = FanState()
                     }
-                    continue
+                } else {
+                    self.processFan(fan, profile: profile!, temp: driverTemp, dt: dt, now: now)
                 }
 
-                self.processFan(fan, profile: profile, temp: driverTemp, dt: dt, now: now)
+                let state = self.fanStates[fan.id] ?? FanState()
+                let sustained = state.sustainedSince.map { now.timeIntervalSince($0) }
+                TelemetryLogger.shared.log(
+                    timestamp: now,
+                    temp: driverTemp,
+                    fanID: fan.id,
+                    actualRPM: fan.value,
+                    profile: profile?.name,
+                    engaged: state.engaged,
+                    fraction: state.lastFraction,
+                    targetRPM: state.lastSetRPM,
+                    sustained: sustained
+                )
             }
         }
     }
