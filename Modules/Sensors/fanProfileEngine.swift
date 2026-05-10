@@ -14,30 +14,50 @@
 import Foundation
 import Kit
 
-// Minimum RPM delta before we issue a new setFanSpeed call.
-// Prevents constant SMC writes when the temperature hovers around a curve knee.
-private let hysteresisThreshold: Int = 100
+// Minimum RPM delta before issuing a new setFanSpeed SMC call.
+// Prevents constant SMC churn when temperature hovers around a curve knee.
+private let hysteresisRPMThreshold: Int = 100
 
-// Cap how often the engine acts on a temperature tick regardless of how fast
-// the sensor reader fires.
+// Cap how often the engine acts regardless of how fast the sensor reader fires.
 private let minTickInterval: TimeInterval = 1.0
+
+// MARK: - Per-fan runtime state
+
+private struct FanState {
+    /// True once sustainedTriggerSec has elapsed and the engine has written
+    /// at least one SMC speed command for this fan.
+    var engaged: Bool = false
+
+    /// The moment temperature first crossed startTemp on this engagement cycle.
+    /// Reset to nil whenever temp falls below startTemp.
+    var sustainedSince: Date? = nil
+
+    /// Last fraction written to SMC (0.0–1.0 of fan's full RPM range).
+    /// Used by the ramp governor to limit per-tick speed change.
+    var lastFraction: Double = 0.0
+
+    /// Last RPM written to SMC — used for the 100-RPM hysteresis gate.
+    var lastSetRPM: Int = 0
+
+    /// True if we previously wrote resetAuto for this fan on this disengage
+    /// cycle — prevents spamming setFanMode(.automatic) every tick.
+    var autoWritten: Bool = false
+}
+
+// MARK: - Engine
 
 public class FanProfileEngine {
     public static let shared = FanProfileEngine()
 
     private var profiles: [FanProfile] = []
-    // Last RPM written to each fan id, used for hysteresis.
-    private var lastSetRPM: [Int: Int] = [:]
+    private var fanStates: [Int: FanState] = [:]
+    private var fanBounds: [Int: (min: Double, max: Double)] = [:]
     private var lastTickDate: Date = .distantPast
     private let queue = DispatchQueue(label: "eu.exelban.Stats.FanProfileEngine", qos: .utility)
 
-    // Fan min/max bounds populated when the sensor list is available, so we can
-    // clamp RPM to hardware limits without reaching back to the sensor reader.
-    // TODO: per-fan minSpeed/maxSpeed — currently clamped to 0…maxSpeed from
-    //       the first fan seen; multi-fan machines may have different ranges.
-    private var fanBounds: [Int: (min: Double, max: Double)] = [:]
-
     private init() {
+        // Graceful migration: old JSON used [CurvePoint] schema. If the decode
+        // fails the store just returns [], and the user picks a new preset.
         self.profiles = FanProfileStore.load()
     }
 
@@ -62,68 +82,208 @@ public class FanProfileEngine {
 
     public func removeProfile(id: UUID) {
         profiles.removeAll { $0.id == id }
-        // Clean up the enabled key from Store.
         Store.shared.remove("fanProfile_\(id.uuidString)_enabled")
         FanProfileStore.save(profiles)
     }
 
-    // Called by main.swift once the sensor list is known.
+    /// Called by main.swift once the sensor list is available.
     public func registerFans(_ fans: [Fan]) {
         for fan in fans {
             fanBounds[fan.id] = (min: fan.minSpeed, max: fan.maxSpeed)
         }
     }
 
-    // Called from the sensor reader callback in main.swift on every tick.
-    // sensors: the full Sensors_List.sensors array from the reader callback.
+    /// Called from the sensor reader callback in main.swift on every tick.
     public func processTick(_ sensors: [Sensor_p]) {
         queue.async { [weak self] in
             guard let self else { return }
 
             let now = Date()
-            guard now.timeIntervalSince(self.lastTickDate) >= minTickInterval else { return }
+            let rawDt = now.timeIntervalSince(self.lastTickDate)
+            guard rawDt >= minTickInterval else { return }
+            self.lastTickDate = now
+
+            // Wake / cold-start detection. .distantPast first tick or any gap
+            // longer than 30s (sleep, app pause) means accumulated state is
+            // stale: reset per-fan engagement so the ramp budget can't blow up
+            // and so we don't race PR1's FanPowerManager wake restore.
+            if rawDt > 30 {
+                self.fanStates = [:]
+                return
+            }
+            let dt = min(rawDt, 5.0)
 
             let enabledProfiles = self.profiles.filter { $0.enabled }
             guard !enabledProfiles.isEmpty else { return }
 
-            // Use max CPU temperature, not average. Apple Silicon parks efficiency
-            // cores under low load and parked cores report very low values (~1.5°C)
-            // that pull a naive average far below the actual hot-core temperature
-            // that drives thermals.
+            // Max CPU temperature, filtering parked efficiency-core noise (<5°C).
+            // Apple Silicon parks efficiency cores under low load; they report
+            // near-zero values that drag a naive average far below actual hot-core temp.
             let cpuTemps = sensors
                 .filter { $0.type == .temperature && $0.group == .CPU && $0.value > 5 }
                 .map { $0.value }
             guard let driverTemp = cpuTemps.max() else { return }
 
-            self.lastTickDate = now
-
-            // Skip pseudo-fans (id < 0 represents aggregates like "fastest fan").
+            // Skip pseudo-fans (id < 0 = aggregates like "fastest fan").
             let fans = sensors.compactMap { $0 as? Fan }.filter { $0.id >= 0 }
+
             for fan in fans {
-                guard let profile = self.profileForFan(fan.id) else { continue }
-                let target = profile.targetRPM(forTemperature: driverTemp)
-                let bounds = self.fanBounds[fan.id]
-                let minRPM = Int(bounds?.min ?? 0)
-                let maxRPM = bounds.map { Int($0.max) } ?? target
-                let clamped = max(minRPM, min(maxRPM == 0 ? target : maxRPM, target))
+                guard let profile = self.profileForFan(fan.id) else {
+                    // No enabled profile for this fan — release it if we owned it.
+                    if self.fanStates[fan.id]?.engaged == true {
+                        SMCHelper.shared.setFanMode(fan.id, mode: FanMode.automatic.rawValue)
+                        self.fanStates[fan.id] = FanState()
+                    }
+                    continue
+                }
 
-                if let last = self.lastSetRPM[fan.id], abs(clamped - last) < hysteresisThreshold { continue }
-
-                self.lastSetRPM[fan.id] = clamped
-                SMCHelper.shared.setFanMode(fan.id, mode: FanMode.forced.rawValue)
-                SMCHelper.shared.setFanSpeed(fan.id, speed: clamped)
+                self.processFan(fan, profile: profile, temp: driverTemp, dt: dt, now: now)
             }
         }
     }
 
+    /// Release all engine-owned fans back to Apple auto on app quit.
+    /// Synchronous — willTerminate gives only ~5s before the process exits;
+    /// an async dispatch can be skipped entirely if the main thread is busy.
     public func releaseAll(fans: [Fan]) {
-        queue.async {
+        queue.sync {
             for fan in fans {
-                guard self.lastSetRPM[fan.id] != nil else { continue }
+                guard self.fanStates[fan.id] != nil else { continue }
                 SMCHelper.shared.setFanMode(fan.id, mode: FanMode.automatic.rawValue)
             }
-            self.lastSetRPM = [:]
+            self.fanStates = [:]
         }
+    }
+
+    // MARK: - Per-fan tick logic
+
+    private func processFan(_ fan: Fan, profile: FanProfile, temp: Double, dt: TimeInterval, now: Date) {
+        let curve = profile.curve
+        var state = fanStates[fan.id] ?? FanState()
+        defer { fanStates[fan.id] = state }
+
+        let bounds = fanBounds[fan.id]
+        let minRPM = bounds?.min ?? 0
+        let maxRPM = bounds.map { $0.max } ?? Double(fan.maxSpeed > 0 ? fan.maxSpeed : 6000)
+
+        // ── Hands-off profile (Silent) ──────────────────────────────────────
+        // Do not write fan speeds. If we previously held it, release once.
+        if curve.handsOff {
+            if state.engaged && !state.autoWritten {
+                SMCHelper.shared.setFanMode(fan.id, mode: FanMode.automatic.rawValue)
+                state = FanState()
+                state.autoWritten = true
+            }
+            return
+        }
+
+        // ── Disengage: temp below stopTemp ──────────────────────────────────
+        if temp <= curve.stopTemp {
+            if state.engaged {
+                NSLog("FanProfileEngine: fan %d off (%.1f°C ≤ %.0f°C stopTemp) [%@]",
+                      fan.id, temp, curve.stopTemp, profile.name)
+                SMCHelper.shared.setFanMode(fan.id, mode: FanMode.automatic.rawValue)
+            }
+            state = FanState()
+            return
+        }
+
+        // ── Hysteresis band: stopTemp < temp < startTemp ────────────────────
+        // If already engaged, coast down toward minimum via the ramp governor;
+        // otherwise stay idle.
+        if temp < curve.startTemp {
+            if !state.engaged {
+                state.sustainedSince = nil
+                return
+            }
+            let minFraction = maxRPM > 0 ? minRPM / maxRPM : 0
+            let rampDownBudget = curve.rampDownPerSec * dt
+            var coastTarget = state.lastFraction
+            if coastTarget > minFraction {
+                coastTarget = max(minFraction, coastTarget - rampDownBudget)
+            }
+            applyFraction(coastTarget, fan: fan, state: &state, minRPM: minRPM, maxRPM: maxRPM, profile: profile)
+            return
+        }
+
+        // ── Above startTemp ─────────────────────────────────────────────────
+        // Start sustained timer on first crossing.
+        if state.sustainedSince == nil {
+            state.sustainedSince = now
+        }
+
+        // Wait for sustained trigger before engaging.
+        if !state.engaged {
+            let elapsed = now.timeIntervalSince(state.sustainedSince!)
+            if elapsed < curve.sustainedTriggerSec {
+                NSLog("FanProfileEngine: fan %d waiting for sustained trigger (%.1f/%.0fs) at %.1f°C [%@]",
+                      fan.id, elapsed, curve.sustainedTriggerSec, temp, profile.name)
+                return
+            }
+            // Trigger met — engage.
+            NSLog("FanProfileEngine: fan %d engaging after %.1fs sustained at %.1f°C [%@]",
+                  fan.id, elapsed, temp, profile.name)
+            state.engaged = true
+        }
+
+        // ── Compute raw target fraction via curve ───────────────────────────
+        guard let rawFraction = curve.targetFraction(at: temp) else {
+            // targetFraction returns nil only for handsOff or temp≤stopTemp,
+            // both handled above. Defensive path: disengage.
+            SMCHelper.shared.setFanMode(fan.id, mode: FanMode.automatic.rawValue)
+            state = FanState()
+            return
+        }
+
+        // Hysteresis sentinel: curve returned 0.0 meaning "stay at minimum"
+        let minFraction = maxRPM > 0 ? minRPM / maxRPM : 0
+        var targetFraction = rawFraction <= 0.0 ? minFraction : rawFraction
+
+        // Clamp to [minFraction, maxRPMPercent]
+        targetFraction = max(minFraction, min(curve.maxRPMPercent, targetFraction))
+
+        // ── Ramp governor ───────────────────────────────────────────────────
+        // Per-tick budget is (ratePerSec × dt). dt is ≥ minTickInterval (1s)
+        // so at steady state this equals the config rate.
+        let rampUpBudget  = curve.rampUpPerSec  * dt
+        let rampDownBudget = curve.rampDownPerSec * dt
+
+        if targetFraction > state.lastFraction {
+            // instantEngage profiles bypass the ramp-UP governor on every
+            // upward move (matches TF behaviour). Ramp-DOWN still governs.
+            if !curve.instantEngage {
+                targetFraction = min(targetFraction, state.lastFraction + rampUpBudget)
+            }
+        } else if targetFraction < state.lastFraction {
+            targetFraction = max(targetFraction, state.lastFraction - rampDownBudget)
+        }
+
+        applyFraction(targetFraction, fan: fan, state: &state, minRPM: minRPM, maxRPM: maxRPM, profile: profile)
+    }
+
+    // MARK: - SMC write with hysteresis gate
+
+    private func applyFraction(_ fraction: Double, fan: Fan, state: inout FanState,
+                               minRPM: Double, maxRPM: Double, profile: FanProfile) {
+        // Update lastFraction first — the ramp governor reads it next tick and
+        // must see the latest target, even if the SMC write is hysteresis-skipped.
+        // Otherwise small ramp steps that round to the same RPM never advance
+        // the state, and the budget compounds incorrectly.
+        state.lastFraction = fraction
+
+        let targetRPM = max(minRPM, min(maxRPM, maxRPM * fraction))
+        let targetRPMInt = Int(targetRPM.rounded())
+
+        if abs(targetRPMInt - state.lastSetRPM) < hysteresisRPMThreshold { return }
+
+        SMCHelper.shared.setFanMode(fan.id, mode: FanMode.forced.rawValue)
+        SMCHelper.shared.setFanSpeed(fan.id, speed: targetRPMInt)
+
+        NSLog("FanProfileEngine: fan %d → %d RPM (%.3f fraction) [%@]",
+              fan.id, targetRPMInt, fraction, profile.name)
+
+        state.lastSetRPM  = targetRPMInt
+        state.autoWritten = false
     }
 }
 

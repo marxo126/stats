@@ -146,11 +146,13 @@ internal class FanProfileSettingsView: NSStackView {
         let profile = FanProfile(
             name: "Custom",
             fanID: -1,
-            points: [
-                CurvePoint(temperatureC: 40, rpm: 1500),
-                CurvePoint(temperatureC: 70, rpm: 3000),
-                CurvePoint(temperatureC: 90, rpm: 5000)
-            ]
+            curve: Curve(
+                stopTemp: 50, startTemp: 55, ceilingTemp: 75,
+                maxRPMPercent: 0.70,
+                curveShape: .linear,
+                rampUpPerSec: 0.05, rampDownPerSec: 0.025,
+                sustainedTriggerSec: 8
+            )
         )
         FanProfileEngine.shared.addProfile(profile)
         self.reload()
