@@ -12,7 +12,25 @@
 #if arch(arm64)
 
 import Foundation
+import IOKit.ps
 import Kit
+
+// MARK: - Power source detection
+
+private enum PowerSource: String {
+    case ac, battery, unknown
+
+    static var current: PowerSource {
+        guard let snap = IOPSCopyPowerSourcesInfo()?.takeRetainedValue(),
+              let typeRef = IOPSGetProvidingPowerSourceType(snap)?.takeUnretainedValue() else {
+            return .unknown
+        }
+        let type = typeRef as String
+        if type == kIOPSACPowerValue { return .ac }
+        if type == kIOPSBatteryPowerValue { return .battery }
+        return .unknown
+    }
+}
 
 // MARK: - CSV telemetry logger
 
@@ -34,19 +52,19 @@ private final class TelemetryLogger {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.url = dir.appendingPathComponent("fan-telemetry.csv")
         if !FileManager.default.fileExists(atPath: url.path) {
-            let header = "timestamp,driver_temp,cpu_max_temp,gpu_max_temp,slope_c_per_s,fan_id,actual_rpm,profile,engaged,safety,target_fraction,target_rpm,sustained_s\n"
+            let header = "timestamp,driver_temp,cpu_max_temp,gpu_max_temp,vent_max_temp,power_source,slope_c_per_s,fan_id,actual_rpm,profile,engaged,safety,target_fraction,target_rpm,sustained_s\n"
             try? header.write(to: url, atomically: false, encoding: .utf8)
         }
     }
 
     func log(timestamp: Date, driverTemp: Double, cpuMax: Double, gpuMax: Double,
-             slope: Double, fanID: Int, actualRPM: Double, profile: String?,
-             engaged: Bool, safety: Bool, fraction: Double, targetRPM: Int,
-             sustained: TimeInterval?) {
+             ventMax: Double, powerSource: String, slope: Double, fanID: Int,
+             actualRPM: Double, profile: String?, engaged: Bool, safety: Bool,
+             fraction: Double, targetRPM: Int, sustained: TimeInterval?) {
         let ts = isoFormatter.string(from: timestamp)
         let prof = profile ?? ""
         let sus = sustained.map { String(format: "%.1f", $0) } ?? ""
-        let line = "\(ts),\(String(format: "%.1f", driverTemp)),\(String(format: "%.1f", cpuMax)),\(String(format: "%.1f", gpuMax)),\(String(format: "%.2f", slope)),\(fanID),\(String(format: "%.0f", actualRPM)),\(prof),\(engaged),\(safety),\(String(format: "%.4f", fraction)),\(targetRPM),\(sus)\n"
+        let line = "\(ts),\(String(format: "%.1f", driverTemp)),\(String(format: "%.1f", cpuMax)),\(String(format: "%.1f", gpuMax)),\(String(format: "%.1f", ventMax)),\(powerSource),\(String(format: "%.2f", slope)),\(fanID),\(String(format: "%.0f", actualRPM)),\(prof),\(engaged),\(safety),\(String(format: "%.4f", fraction)),\(targetRPM),\(sus)\n"
         queue.async { [weak self] in
             guard let self, let data = line.data(using: .utf8) else { return }
             if self.handle == nil {
@@ -191,8 +209,17 @@ public class FanProfileEngine {
                 .map { $0.value }
             let cpuMax = cpuTemps.max() ?? 0
             let gpuMax = gpuTemps.max() ?? 0
+            // Vent / airflow sensors (TaLP / TaRF / TaLW / TaRW) — surface
+            // temperature proxy. Lap-comfort driver, optional alternative to
+            // die temp. Currently logged only; not yet used as primary driver.
+            let ventTemps = sensors
+                .filter { $0.type == .temperature && $0.group == .sensor && $0.value > 5
+                          && $0.name.contains("Airflow") }
+                .map { $0.value }
+            let ventMax = ventTemps.max() ?? 0
             let driverTemp = max(cpuMax, gpuMax)
             guard driverTemp > 0 else { return }
+            let powerSource = PowerSource.current
 
             // Update rolling temp history + compute slope (°C/sec). Only valid
             // once buffer is full to avoid noisy 1- or 2-sample slopes.
@@ -229,6 +256,8 @@ public class FanProfileEngine {
                     driverTemp: driverTemp,
                     cpuMax: cpuMax,
                     gpuMax: gpuMax,
+                    ventMax: ventMax,
+                    powerSource: powerSource.rawValue,
                     slope: slope,
                     fanID: fan.id,
                     actualRPM: fan.value,
