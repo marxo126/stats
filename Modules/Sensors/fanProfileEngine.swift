@@ -34,18 +34,19 @@ private final class TelemetryLogger {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.url = dir.appendingPathComponent("fan-telemetry.csv")
         if !FileManager.default.fileExists(atPath: url.path) {
-            let header = "timestamp,cpu_max_temp,fan_id,actual_rpm,profile,engaged,target_fraction,target_rpm,sustained_s\n"
+            let header = "timestamp,driver_temp,cpu_max_temp,gpu_max_temp,fan_id,actual_rpm,profile,engaged,safety,target_fraction,target_rpm,sustained_s\n"
             try? header.write(to: url, atomically: false, encoding: .utf8)
         }
     }
 
-    func log(timestamp: Date, temp: Double, fanID: Int, actualRPM: Double,
-             profile: String?, engaged: Bool, fraction: Double, targetRPM: Int,
+    func log(timestamp: Date, driverTemp: Double, cpuMax: Double, gpuMax: Double,
+             fanID: Int, actualRPM: Double, profile: String?, engaged: Bool,
+             safety: Bool, fraction: Double, targetRPM: Int,
              sustained: TimeInterval?) {
         let ts = isoFormatter.string(from: timestamp)
         let prof = profile ?? ""
         let sus = sustained.map { String(format: "%.1f", $0) } ?? ""
-        let line = "\(ts),\(String(format: "%.1f", temp)),\(fanID),\(String(format: "%.0f", actualRPM)),\(prof),\(engaged),\(String(format: "%.4f", fraction)),\(targetRPM),\(sus)\n"
+        let line = "\(ts),\(String(format: "%.1f", driverTemp)),\(String(format: "%.1f", cpuMax)),\(String(format: "%.1f", gpuMax)),\(fanID),\(String(format: "%.0f", actualRPM)),\(prof),\(engaged),\(safety),\(String(format: "%.4f", fraction)),\(targetRPM),\(sus)\n"
         queue.async { [weak self] in
             guard let self, let data = line.data(using: .utf8) else { return }
             if self.handle == nil {
@@ -63,6 +64,13 @@ private let hysteresisRPMThreshold: Int = 100
 
 // Cap how often the engine acts regardless of how fast the sensor reader fires.
 private let minTickInterval: TimeInterval = 1.0
+
+// Safety override: above this temperature, jump to maxRPMPercent immediately
+// regardless of sustainedTriggerSec / ramp governor. Clears via 5° hysteresis.
+// M-series throttles ~83°C GPU under sustained LLM workloads — 92°C is a
+// "should never reach this" backstop, not normal operating territory.
+private let safetyOverrideTemp: Double = 92.0
+private let safetyOverrideClearTemp: Double = 87.0
 
 // MARK: - Per-fan runtime state
 
@@ -85,6 +93,10 @@ private struct FanState {
     /// True if we previously wrote resetAuto for this fan on this disengage
     /// cycle — prevents spamming setFanMode(.automatic) every tick.
     var autoWritten: Bool = false
+
+    /// True while temp is in the safety override band (≥92°C, clears <87°C).
+    /// Logged to telemetry so we can see how often it fires.
+    var safetyActive: Bool = false
 }
 
 // MARK: - Engine
@@ -159,13 +171,21 @@ public class FanProfileEngine {
             let enabledProfiles = self.profiles.filter { $0.enabled }
             guard !enabledProfiles.isEmpty else { return }
 
-            // Max CPU temperature, filtering parked efficiency-core noise (<5°C).
-            // Apple Silicon parks efficiency cores under low load; they report
-            // near-zero values that drag a naive average far below actual hot-core temp.
+            // Max temperature across CPU and GPU sensor groups. Apple Silicon parks
+            // efficiency cores under low load (≤5°C noise floor); filter those.
+            // GPU group includes a miscategorized NAND CH% sensor in some builds —
+            // exclude by name pattern.
             let cpuTemps = sensors
                 .filter { $0.type == .temperature && $0.group == .CPU && $0.value > 5 }
                 .map { $0.value }
-            guard let driverTemp = cpuTemps.max() else { return }
+            let gpuTemps = sensors
+                .filter { $0.type == .temperature && $0.group == .GPU && $0.value > 5
+                          && !$0.key.contains("NAND") && !$0.name.contains("NAND") }
+                .map { $0.value }
+            let cpuMax = cpuTemps.max() ?? 0
+            let gpuMax = gpuTemps.max() ?? 0
+            let driverTemp = max(cpuMax, gpuMax)
+            guard driverTemp > 0 else { return }
 
             // Skip pseudo-fans (id < 0 = aggregates like "fastest fan").
             let fans = sensors.compactMap { $0 as? Fan }.filter { $0.id >= 0 }
@@ -185,11 +205,14 @@ public class FanProfileEngine {
                 let sustained = state.sustainedSince.map { now.timeIntervalSince($0) }
                 TelemetryLogger.shared.log(
                     timestamp: now,
-                    temp: driverTemp,
+                    driverTemp: driverTemp,
+                    cpuMax: cpuMax,
+                    gpuMax: gpuMax,
                     fanID: fan.id,
                     actualRPM: fan.value,
                     profile: profile?.name,
                     engaged: state.engaged,
+                    safety: state.safetyActive,
                     fraction: state.lastFraction,
                     targetRPM: state.lastSetRPM,
                     sustained: sustained
@@ -222,7 +245,23 @@ public class FanProfileEngine {
         let minRPM = bounds?.min ?? 0
         let maxRPM = bounds.map { $0.max } ?? Double(fan.maxSpeed > 0 ? fan.maxSpeed : 6000)
 
-        // ── Hands-off profile (Silent) ──────────────────────────────────────
+        // ── Safety override: ≥92°C bypasses sustained timer + ramp governor ──
+        // Apple Silicon throttles ~83°C GPU under sustained LLM. 92°C means
+        // something is wrong — blast 100% immediately. Clears at <87°C
+        // (5° hysteresis to avoid flapping).
+        if !curve.handsOff && temp >= safetyOverrideTemp {
+            state.engaged = true
+            state.sustainedSince = state.sustainedSince ?? now
+            state.safetyActive = true
+            let target = curve.maxRPMPercent > 0 ? curve.maxRPMPercent : 1.0
+            applyFraction(target, fan: fan, state: &state, minRPM: minRPM, maxRPM: maxRPM, profile: profile)
+            return
+        }
+        if state.safetyActive && temp < safetyOverrideClearTemp {
+            state.safetyActive = false
+        }
+
+        // ── Hands-off profile (Automatic) ───────────────────────────────────
         // Do not write fan speeds. If we previously held it, release once.
         if curve.handsOff {
             if state.engaged && !state.autoWritten {
