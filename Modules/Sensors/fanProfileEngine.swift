@@ -34,19 +34,19 @@ private final class TelemetryLogger {
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         self.url = dir.appendingPathComponent("fan-telemetry.csv")
         if !FileManager.default.fileExists(atPath: url.path) {
-            let header = "timestamp,driver_temp,cpu_max_temp,gpu_max_temp,fan_id,actual_rpm,profile,engaged,safety,target_fraction,target_rpm,sustained_s\n"
+            let header = "timestamp,driver_temp,cpu_max_temp,gpu_max_temp,slope_c_per_s,fan_id,actual_rpm,profile,engaged,safety,target_fraction,target_rpm,sustained_s\n"
             try? header.write(to: url, atomically: false, encoding: .utf8)
         }
     }
 
     func log(timestamp: Date, driverTemp: Double, cpuMax: Double, gpuMax: Double,
-             fanID: Int, actualRPM: Double, profile: String?, engaged: Bool,
-             safety: Bool, fraction: Double, targetRPM: Int,
+             slope: Double, fanID: Int, actualRPM: Double, profile: String?,
+             engaged: Bool, safety: Bool, fraction: Double, targetRPM: Int,
              sustained: TimeInterval?) {
         let ts = isoFormatter.string(from: timestamp)
         let prof = profile ?? ""
         let sus = sustained.map { String(format: "%.1f", $0) } ?? ""
-        let line = "\(ts),\(String(format: "%.1f", driverTemp)),\(String(format: "%.1f", cpuMax)),\(String(format: "%.1f", gpuMax)),\(fanID),\(String(format: "%.0f", actualRPM)),\(prof),\(engaged),\(safety),\(String(format: "%.4f", fraction)),\(targetRPM),\(sus)\n"
+        let line = "\(ts),\(String(format: "%.1f", driverTemp)),\(String(format: "%.1f", cpuMax)),\(String(format: "%.1f", gpuMax)),\(String(format: "%.2f", slope)),\(fanID),\(String(format: "%.0f", actualRPM)),\(prof),\(engaged),\(safety),\(String(format: "%.4f", fraction)),\(targetRPM),\(sus)\n"
         queue.async { [weak self] in
             guard let self, let data = line.data(using: .utf8) else { return }
             if self.handle == nil {
@@ -110,6 +110,12 @@ public class FanProfileEngine {
     private var lastTickDate: Date = .distantPast
     private let queue = DispatchQueue(label: "eu.exelban.Stats.FanProfileEngine", qos: .utility)
 
+    // Rolling driver-temp history for rate-of-change boost. 4 samples at 1 Hz
+    // = 3-second window. Smooths sensor jitter (~1-2°C noise floor) before
+    // computing slope, since raw consecutive-sample derivative amplifies noise.
+    private var tempHistory: [Double] = []
+    private static let tempHistoryCapacity = 4
+
     private init() {
         // Graceful migration: old JSON used [CurvePoint] schema. If the decode
         // fails the store just returns [], and the user picks a new preset.
@@ -164,6 +170,7 @@ public class FanProfileEngine {
             // and so we don't race PR1's FanPowerManager wake restore.
             if rawDt > 30 {
                 self.fanStates = [:]
+                self.tempHistory = []
                 return
             }
             let dt = min(rawDt, 5.0)
@@ -187,6 +194,20 @@ public class FanProfileEngine {
             let driverTemp = max(cpuMax, gpuMax)
             guard driverTemp > 0 else { return }
 
+            // Update rolling temp history + compute slope (°C/sec). Only valid
+            // once buffer is full to avoid noisy 1- or 2-sample slopes.
+            self.tempHistory.append(driverTemp)
+            if self.tempHistory.count > Self.tempHistoryCapacity {
+                self.tempHistory.removeFirst()
+            }
+            let slope: Double
+            if self.tempHistory.count == Self.tempHistoryCapacity {
+                let span = Double(Self.tempHistoryCapacity - 1)  // 3 ticks ≈ 3 s at 1 Hz
+                slope = (self.tempHistory.last! - self.tempHistory.first!) / span
+            } else {
+                slope = 0
+            }
+
             // Skip pseudo-fans (id < 0 = aggregates like "fastest fan").
             let fans = sensors.compactMap { $0 as? Fan }.filter { $0.id >= 0 }
 
@@ -198,7 +219,7 @@ public class FanProfileEngine {
                         self.fanStates[fan.id] = FanState()
                     }
                 } else {
-                    self.processFan(fan, profile: profile!, temp: driverTemp, dt: dt, now: now)
+                    self.processFan(fan, profile: profile!, temp: driverTemp, slope: slope, dt: dt, now: now)
                 }
 
                 let state = self.fanStates[fan.id] ?? FanState()
@@ -208,6 +229,7 @@ public class FanProfileEngine {
                     driverTemp: driverTemp,
                     cpuMax: cpuMax,
                     gpuMax: gpuMax,
+                    slope: slope,
                     fanID: fan.id,
                     actualRPM: fan.value,
                     profile: profile?.name,
@@ -236,7 +258,7 @@ public class FanProfileEngine {
 
     // MARK: - Per-fan tick logic
 
-    private func processFan(_ fan: Fan, profile: FanProfile, temp: Double, dt: TimeInterval, now: Date) {
+    private func processFan(_ fan: Fan, profile: FanProfile, temp: Double, slope: Double, dt: TimeInterval, now: Date) {
         let curve = profile.curve
         var state = fanStates[fan.id] ?? FanState()
         defer { fanStates[fan.id] = state }
@@ -333,6 +355,20 @@ public class FanProfileEngine {
         // Hysteresis sentinel: curve returned 0.0 meaning "stay at minimum"
         let minFraction = maxRPM > 0 ? minRPM / maxRPM : 0
         var targetFraction = rawFraction <= 0.0 ? minFraction : rawFraction
+
+        // ── Rate-of-change boost (rising only) ──────────────────────────────
+        // Add slope-proportional kick to target during fast climbs. Mirrors
+        // ThermalForge's approach: factor scales 0.15→0.30 with urgency
+        // (how close temp is to ceilingTemp). Boost only when:
+        //   - already engaged (sustained timer passed)
+        //   - slope > 0 (temp rising)
+        //   - safety override not active (already at maxRPMPercent there)
+        if state.engaged && !state.safetyActive && slope > 0 {
+            let denom = max(1.0, curve.ceilingTemp - curve.startTemp)
+            let urgency = max(0, min(1, (temp - curve.startTemp) / denom))
+            let boostFactor = 0.15 + urgency * 0.15
+            targetFraction += boostFactor * slope
+        }
 
         // Clamp to [minFraction, maxRPMPercent]
         targetFraction = max(minFraction, min(curve.maxRPMPercent, targetFraction))
