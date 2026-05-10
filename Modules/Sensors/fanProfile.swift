@@ -159,67 +159,50 @@ public struct FanProfile: Codable, Identifiable {
 // MARK: - Built-in presets
 
 public enum FanProfilePreset: CaseIterable {
-    case silent, balanced, performance, max, smart
+    case smart, full, automatic
 
     public var profile: FanProfile {
         switch self {
-        case .silent:
-            return FanProfile(
-                name: "Silent",
-                fanID: -1,
-                curve: Curve(
-                    stopTemp: 50, startTemp: 55, ceilingTemp: 55,
-                    maxRPMPercent: 0,
-                    handsOff: true
-                )
-            )
-        case .balanced:
-            return FanProfile(
-                name: "Balanced",
-                fanID: -1,
-                curve: Curve(
-                    stopTemp: 50, startTemp: 55, ceilingTemp: 70,
-                    maxRPMPercent: 0.60,
-                    curveShape: .easeIn,
-                    rampUpPerSec: 0.05, rampDownPerSec: 0.025,
-                    sustainedTriggerSec: 8
-                )
-            )
-        case .performance:
-            return FanProfile(
-                name: "Performance",
-                fanID: -1,
-                curve: Curve(
-                    stopTemp: 50, startTemp: 55, ceilingTemp: 65,
-                    maxRPMPercent: 0.85,
-                    curveShape: .linear,
-                    rampUpPerSec: 0.10, rampDownPerSec: 0.04,
-                    sustainedTriggerSec: 4
-                )
-            )
-        case .max:
-            return FanProfile(
-                name: "Max",
-                fanID: -1,
-                curve: Curve(
-                    stopTemp: 50, startTemp: 65, ceilingTemp: 65,
-                    maxRPMPercent: 1.0,
-                    curveShape: .linear,
-                    rampUpPerSec: 1.0, rampDownPerSec: 0.025,
-                    sustainedTriggerSec: 5,
-                    instantEngage: true
-                )
-            )
         case .smart:
+            // Tuned from real LLM-workload telemetry on Apple Silicon:
+            //  - workload bursts hot/cold rapidly (+15°C / -19°C in 5s windows)
+            //  - silicon-bound past ~80°C (more fan can't help further)
+            //  - cool windows reach 58-65°C — must release fans there
             return FanProfile(
                 name: "Smart",
                 fanID: -1,
                 curve: Curve(
-                    stopTemp: 50, startTemp: 53, ceilingTemp: 85,
+                    stopTemp: 60, startTemp: 65, ceilingTemp: 80,
                     maxRPMPercent: 1.0,
                     curveShape: .sCurve,
-                    rampUpPerSec: 0.05, rampDownPerSec: 0.025,
-                    sustainedTriggerSec: 6
+                    rampUpPerSec: 0.15, rampDownPerSec: 0.06,
+                    sustainedTriggerSec: 3
+                )
+            )
+        case .full:
+            // Always blast 100%. Engages immediately, never disengages while running.
+            return FanProfile(
+                name: "Full",
+                fanID: -1,
+                curve: Curve(
+                    stopTemp: 0, startTemp: 0, ceilingTemp: 1,
+                    maxRPMPercent: 1.0,
+                    curveShape: .linear,
+                    rampUpPerSec: 1.0, rampDownPerSec: 1.0,
+                    sustainedTriggerSec: 0,
+                    instantEngage: true
+                )
+            )
+        case .automatic:
+            // Hands-off: let Apple's firmware manage fans. Engine releases the
+            // fan to .automatic once and then writes nothing.
+            return FanProfile(
+                name: "Automatic (Apple)",
+                fanID: -1,
+                curve: Curve(
+                    stopTemp: 50, startTemp: 50, ceilingTemp: 50,
+                    maxRPMPercent: 0,
+                    handsOff: true
                 )
             )
         }
