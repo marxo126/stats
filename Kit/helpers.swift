@@ -906,15 +906,18 @@ public class SettingsContainerView: NSStackView {
 public class SMCHelper {
     public static let shared = SMCHelper()
 
-    // On macOS 13+ the daemon is managed by SMAppService; the old
-    // PrivilegedHelperTools path is never populated by that API.
+    // On macOS 13+ SMAppService is the official answer; also check the legacy
+    // file path so a manual sudo install or a prior SMJobBless install is
+    // detected.
     public var isInstalled: Bool {
+        if FileManager.default.fileExists(atPath: "/Library/PrivilegedHelperTools/eu.exelban.Stats.SMC.Helper") {
+            return true
+        }
         if #available(macOS 13.0, *) {
             let status = SMAppService.daemon(plistName: "eu.exelban.Stats.SMC.Helper.plist").status
             return status == .enabled || status == .requiresApproval
-        } else {
-            return syncShell("ls /Library/PrivilegedHelperTools/").contains("eu.exelban.Stats.SMC.Helper")
         }
+        return false
     }
 
     // Returns true when the daemon is fully enabled (XPC calls will succeed).
