@@ -175,8 +175,8 @@ public enum FanProfilePreset: CaseIterable {
                     stopTemp: 60, startTemp: 65, ceilingTemp: 80,
                     maxRPMPercent: 1.0,
                     curveShape: .sCurve,
-                    rampUpPerSec: 0.15, rampDownPerSec: 0.06,
-                    sustainedTriggerSec: 3
+                    rampUpPerSec: 0.15, rampDownPerSec: 0.10,
+                    sustainedTriggerSec: 2
                 )
             )
         case .full:
