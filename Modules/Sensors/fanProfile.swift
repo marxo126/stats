@@ -172,7 +172,7 @@ public enum FanProfilePreset: CaseIterable {
                 name: "Smart",
                 fanID: -1,
                 curve: Curve(
-                    stopTemp: 60, startTemp: 65, ceilingTemp: 80,
+                    stopTemp: 55, startTemp: 65, ceilingTemp: 80,
                     maxRPMPercent: 1.0,
                     curveShape: .sCurve,
                     rampUpPerSec: 0.15, rampDownPerSec: 0.10,
